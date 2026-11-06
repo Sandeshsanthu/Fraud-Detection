@@ -1,0 +1,12 @@
+# filename: Brain/config/rules.yaml
+velocity_max_5m: 10          # decline if more than this many payments in 5 min (incl. this one)
+large_amount_multiple: 6     # "large" = amount >= 6x the 30-day average
+stale_after_s: 3600          # TESTING value; use 300 in production
+stepup_min_minor:            # cautious floors (minor units) by feature state
+  stale: 5000
+  missing: 20000
+  unavailable: 10000
+policy:
+  ml_mode: shadow            # off | shadow | live
+  approve_below: 0.70
+  decline_above: 0.92

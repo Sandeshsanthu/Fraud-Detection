@@ -1,0 +1,33 @@
+# filename: docker-compose.yml
+services:
+  decision-service:                 # card [5]
+    build: ./Brain
+    image: decision-service:0.1.0
+    expose: ["9000"]
+    environment:
+      BUDGET_MS: "50"
+      DDB_TIMEOUT_MS: "20"
+      FEATURE_TABLE: card_features
+      KINESIS_STREAM: fraud-decisions
+      RULES_PATH: config/rules.yaml
+      MODEL_PATH: models/model.txt
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local          # local only: fake credentials
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - ./Brain/config:/srv/config:ro   # edit rules.yaml on your PC; reloaded within 30 s
+      - ./Brain/models:/srv/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9000/healthz', timeout=1)"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  front-door:                       # card [4], local stand-in for the NLB
+    image: haproxy:2.9-alpine
+    ports: ["8080:8080"]
+    volumes: ["./nlb-haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    depends_on:
+      decision-service:
+        condition: service_healthy

@@ -2,7 +2,7 @@
 # filename: txn_generator.py
 """Cards [1] Customer and [2] Merchant: fake payment generator. Fake data only."""
 import argparse, asyncio, json, math, random, time, uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -14,12 +14,15 @@ COUNTRIES = ["US", "CA", "GB", "DE", "MX", "BR", "NG", "SG"]
 MCCS = ["5411", "5812", "5541", "5311", "4829", "7995", "5944"]
 BINS = ["999001", "999002", "999003"]  # made-up BINs, not real ranges
 START = datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)  # fixed so runs are repeatable
+FLAGGED = ("DECLINE", "STEP_UP", "REVIEW")                # any non-approve outcome
 
 
 def make_world(rng, n_cards, n_merchants):
     cards = [{"token": "tok_" + rng.randbytes(12).hex(), "bin": rng.choice(BINS),
               "country": rng.choice(COUNTRIES[:4]), "typical": rng.choice([2000, 4500, 9000])}
              for _ in range(n_cards)]
+    for c in cards:  # two known devices per card; uses no rng
+        c["devices"] = [f"dev_{c['token'][4:12]}_a", f"dev_{c['token'][4:12]}_b"]
     merchants = [{"id": f"m_{i:05d}", "mcc": rng.choice(MCCS), "country": rng.choice(COUNTRIES)}
                  for i in range(n_merchants)]
     return cards, merchants
@@ -27,6 +30,8 @@ def make_world(rng, n_cards, n_merchants):
 
 def make_txn(rng, t, card, merchant, amount, label, sid=None, channel="POS"):
     """One payment in the v1.0 contract shape. t = simulated seconds since START."""
+    # Fraud scenarios (sid set) use a device the card has never used; normal ones use known devices.
+    device = f"dev_x_{sid}" if sid else card["devices"][int(t) % 2]
     payload = {
         "schema_version": "1.0",
         "transaction_id": str(uuid.UUID(int=rng.getrandbits(128), version=4)),
@@ -35,11 +40,13 @@ def make_txn(rng, t, card, merchant, amount, label, sid=None, channel="POS"):
         "amount_minor": amount, "currency": "USD",
         "channel": channel, "entry_mode": "chip" if channel == "POS" else "ecom",
         "merchant": {"id": merchant["id"], "mcc": merchant["mcc"], "country": merchant["country"]},
+        "device_id": device,
     }
     return t, payload, label, sid
 
 
 def normal(rng, world, t):
+    """One ordinary payment: typical amount for the card, known device."""
     cards, merchants = world
     c = rng.choice(cards)
     amount = max(100, int(rng.lognormvariate(math.log(c["typical"]), 0.6)))
@@ -47,10 +54,10 @@ def normal(rng, world, t):
 
 
 def velocity(rng, world, t):
-    """6 payments on one card; 5 gaps of 15-22 s means at most 110 s, inside 2 minutes."""
+    """12 payments on one card; 11 gaps of 15-22 s is at most 242 s, inside 5 minutes."""
     cards, merchants = world
     c, sid, out = rng.choice(cards), f"s{rng.getrandbits(32):08x}", []
-    for _ in range(6):
+    for _ in range(12):
         out.append(make_txn(rng, t, c, rng.choice(merchants), rng.randint(1500, 6000),
                             "fraud_velocity", sid))
         t += rng.uniform(15, 22)
@@ -91,7 +98,7 @@ def build_schedule(a):
         kind = rng.choice(scenarios) if rng.random() < a.fraud_rate else normal
         events += kind(rng, world, t)
     events.sort(key=lambda e: e[0])
-    return events
+    return events, world
 
 
 def write_files(events, a):
@@ -100,6 +107,14 @@ def write_files(events, a):
             pay.write(json.dumps(p) + "\n")
             lab.write(json.dumps({"transaction_id": p["transaction_id"],
                                   "label": label, "scenario_id": sid}) + "\n")
+
+
+def write_cards(world, path):
+    """Export the generated cards so the feature store [6] can be seeded with the same ones."""
+    with open(path, "w") as f:
+        for c in world[0]:
+            f.write(json.dumps({"token": c["token"], "avg": f"{c['typical'] / 100:.2f}",
+                                "devices": c["devices"]}) + "\n")
 
 
 def summary(events):
@@ -111,48 +126,67 @@ def summary(events):
             spans[sid] = (min(lo, t), max(hi, t))
     if spans:
         longest = max(hi - lo for lo, hi in spans.values())
-        print(f"velocity bursts={len(spans)} longest span={longest:.0f}s (must be <= 120)")
+        print(f"velocity bursts={len(spans)} longest span={longest:.0f}s (must be < 300)")
 
 
 async def replay(events, a):
     results, tasks = [], []
 
     async def fire(p, label):
-        started, outcome, decision = time.perf_counter(), "error", None
+        started, outcome, decision, reasons = time.perf_counter(), "error", None, []
         try:
             r = await client.post(a.url, json=p, headers={
                 "Idempotency-Key": p["transaction_id"], "X-Deadline-Ms": str(a.timeout_ms)})
             outcome = "ok" if r.status_code == 200 else f"http_{r.status_code}"
-            decision = r.json().get("decision") if r.status_code == 200 else None
+            if r.status_code == 200:
+                body = r.json()
+                decision, reasons = body.get("decision"), body.get("reasons", [])
         except httpx.TimeoutException:
             outcome = "timeout"
         except httpx.HTTPError:
             pass
-        results.append((label, outcome, decision, (time.perf_counter() - started) * 1000))
+        results.append((label, outcome, decision, (time.perf_counter() - started) * 1000, reasons))
 
     limits = httpx.Limits(max_connections=a.max_connections,
                           max_keepalive_connections=a.max_connections)
     async with httpx.AsyncClient(timeout=a.timeout_ms / 1000, limits=limits) as client:
         t0 = time.monotonic()
-        for t, p, label, _ in events:  # open loop: never wait for a response
-            delay = t / a.speedup - (time.monotonic() - t0)
-            if delay > 0:
-                await asyncio.sleep(delay)
+        for i, (t, p, label, _) in enumerate(events):  # open loop: never wait for a response
+            lag = (time.monotonic() - t0) - t / a.speedup   # > 0 means the script is behind
+            await asyncio.sleep(max(-lag, 0))               # always yield so started tasks can run
             tasks.append(asyncio.create_task(fire(p, label)))
+            if i % 1000 == 0:
+                print(f"sent {i}/{len(events)}  behind schedule by {max(lag, 0):.2f}s", flush=True)
         await asyncio.gather(*tasks)
     return results
 
 
 def report(results, a):
+    if not results:
+        print("no results")
+        return
     lat = sorted(r[3] for r in results)
     pct = lambda q: lat[min(len(lat) - 1, int(q * len(lat)))]
     over = sum(x > a.timeout_ms for x in lat)
-    fraud = [r for r in results if r[0] != "normal"]
-    caught = sum(r[2] in ("DECLINE", "REVIEW") for r in fraud)
     print(f"outcomes={dict(Counter(r[1] for r in results))}")
     print(f"latency ms p50={pct(.5):.1f} p95={pct(.95):.1f} p99={pct(.99):.1f} "
-          f"over_budget={over} ({over / len(lat):.2%})")
-    print(f"fraud caught {caught}/{len(fraud)}")
+          f"over_budget={over} ({over / len(lat):.2%})  (client-side; includes HAProxy + Docker hop)")
+
+    fraud = [r for r in results if r[0] != "normal"]
+    good = [r for r in results if r[0] == "normal"]
+    print(f"fraud flagged {sum(r[2] in FLAGGED for r in fraud)}/{len(fraud)}  "
+          f"good customers flagged {sum(r[2] in FLAGGED for r in good)}/{len(good)}")
+
+    by, why = defaultdict(Counter), defaultdict(Counter)  # decisions, and the reasons behind flags
+    for label, _, decision, _, reasons in results:
+        by[label][decision or "none"] += 1
+        if decision in FLAGGED:
+            why[label][",".join(reasons) or "-"] += 1
+    for label in sorted(by):
+        print(f"  {label:16s} {dict(by[label])}")
+    print("why flagged:")
+    for label in sorted(why):
+        print(f"  {label:16s} {dict(why[label])}")
 
 
 def main():
@@ -165,14 +199,17 @@ def main():
     p.add_argument("--fraud-rate", type=float, default=0.01, help="share of arrivals that start a fraud scenario")
     p.add_argument("--out", default="payments.jsonl")
     p.add_argument("--labels", default="labels.jsonl")
+    p.add_argument("--cards-out", default="cards.jsonl", help="cards file used to seed DynamoDB")
     p.add_argument("--url", help="if set, also send payments to this endpoint")
     p.add_argument("--speedup", type=float, default=1, help="send faster than simulated time")
-    p.add_argument("--timeout-ms", type=int, default=50)
+    p.add_argument("--timeout-ms", type=int, default=100,
+                   help="client timeout; above the 50 ms service budget to allow for HAProxy and Docker")
     p.add_argument("--max-connections", type=int, default=500)
     a = p.parse_args()
 
-    events = build_schedule(a)
+    events, world = build_schedule(a)
     write_files(events, a)
+    write_cards(world, a.cards_out)
     summary(events)
     if a.url:
         if httpx is None:
@@ -183,5 +220,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-# python3 txn_generator.py --tps 100 --duration 60 --seed 42
+# Generate files only (read the payments= line before replaying):
+#   python txn_generator.py --tps 100 --duration 60 --seed 42
+# Replay at 2x (about 5.5 min; the speed a Windows + Docker Desktop PC can usually keep up with):
+#   python txn_generator.py --tps 100 --duration 60 --seed 42 --speedup 2 --url http://localhost:8080/v1/decide

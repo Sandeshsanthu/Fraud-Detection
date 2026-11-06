@@ -1,1 +1,26 @@
 # Fraud-Detection
+$line = Get-Content payments.jsonl -TotalCount 1
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/authorize `
+  -ContentType "application/json" -Body $line
+
+Get-Content payments.jsonl -TotalCount 100 | ForEach-Object {
+  $r = Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/authorize `
+         -ContentType "application/json" -Body $_
+  $r.decision
+} | Group-Object | Select-Object Name, Count
+
+
+
+
+# Take only the first line of the file
+$line = Get-Content .\transactions.jsonl -TotalCount 1
+
+# Send it through HAProxy to the decision service
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/decide `
+  -ContentType "application/json" -Body $line
+
+
+
+docker compose run --rm --no-deps `
+  -v "${PWD}/tools:/tools:ro" -v "${PWD}/cards.jsonl:/cards.jsonl:ro" `
+  -e CARDS_FILE=/cards.jsonl decision-service python /tools/seed.py   
