@@ -1,32 +1,15 @@
-# Fraud-Detection
-$line = Get-Content payments.jsonl -TotalCount 1
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/authorize `
-  -ContentType "application/json" -Body $line
+python -m unittest tests.test_logic -v
 
-Get-Content payments.jsonl -TotalCount 100 | ForEach-Object {
-  $r = Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/authorize `
-         -ContentType "application/json" -Body $_
-  $r.decision
-} | Group-Object | Select-Object Name, Count
+python -m tests.offline_sim
 
+python txn_generator.py --tps 100 --duration 60 --seed 42 --out data/payments.jsonl --labels data/labels.jsonl --cards-out data/cards.jsonl
 
+python txn_generator.py --tps 100 --duration 60 --seed 42 --speedup 1 --timeout-ms 300 --url http://localhost:8080/v1/decide --out data/payments.jsonl --labels data/labels.jsonl --cards-out data/cards.jsonl
 
+docker compose run --rm --no-deps setup python -m scripts.check
 
-# Take only the first line of the file
-$line = Get-Content .\transactions.jsonl -TotalCount 1
+docker compose stop 
 
-# Send it through HAProxy to the decision service
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/decide `
-  -ContentType "application/json" -Body $line
-
-
-
-docker compose run --rm `
-  -v "${PWD}/tools:/tools:ro" -v "${PWD}/cards.jsonl:/cards.jsonl:ro" `
-  -e CARDS_FILE=/cards.jsonl decision-service python /tools/seed.py
-
-  python txn_generator.py --tps 100 --duration 60 --seed 42 --speedup 1 --url http://localhost:8080/v1/decide
-
-
-
-  docker compose run --rm -v "${PWD}/tools:/tools:ro" decision-service python /tools/counter.py
+python scripts/smoke.py --url http://localhost:8080/v1/decide
+docker compose start 
+$env:FEATURE_MODE="poller"; docker compose --profile poller up -d --build
