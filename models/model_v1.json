@@ -1,0 +1,14 @@
+{
+  "_file": "Fraud-Detection/models/models_v1.json",
+  "version": "v1",
+  "note": "Hand-set logistic weights standing in for XGBoost/LightGBM. Replace with a trained model later.",
+  "bias": -5.0,
+  "weights": {
+    "count_excess": 0.8,
+    "new_device": 1.6,
+    "country_changed": 1.0,
+    "ratio_excess": 0.9,
+    "tiny_burst": 1.2,
+    "ecom": 0.0
+  }
+}

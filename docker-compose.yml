@@ -1,33 +1,71 @@
-# filename: docker-compose.yml
-services:
-  decision-service:                 # card [5]
-    build: ./Brain
-    image: decision-service:0.1.0
-    expose: ["9000"]
-    environment:
-      BUDGET_MS: "50"
-      DDB_TIMEOUT_MS: "20"
-      FEATURE_TABLE: card_features
-      KINESIS_STREAM: fraud-decisions
-      RULES_PATH: config/rules.yaml
-      MODEL_PATH: models/model.txt
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: local          # local only: fake credentials
-      AWS_SECRET_ACCESS_KEY: local
-      AWS_EC2_METADATA_DISABLED: "true"
-    volumes:
-      - ./Brain/config:/srv/config:ro   # edit rules.yaml on your PC; reloaded within 30 s
-      - ./Brain/models:/srv/models:ro
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9000/healthz', timeout=1)"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
+#Fraud-Detection/docker-composer.yml
+name: fraudlocal            # network becomes fraudlocal_default (LocalStack Lambda joins it)
 
-  front-door:                       # card [4], local stand-in for the NLB
+x-py: &py
+  build: .
+  environment: &env
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    PYTHONUNBUFFERED: "1"
+
+services:
+  # Stand-in for AWS: DynamoDB [6], Kinesis [11], Lambda [12], S3 [16], SNS [15]
+  localstack:
+    image: localstack/localstack:3.8
+    ports: ["4566:4566"]
+    environment:
+      SERVICES: dynamodb,kinesis,lambda,s3,sns,iam,sts,logs
+      LAMBDA_DOCKER_NETWORK: fraudlocal_default
+      DEBUG: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health >/dev/null"]
+      interval: 5s
+      retries: 30
+
+  # One-shot: creates tables/stream/bucket/Lambda and seeds cards from data/cards.jsonl.
+  # Also used for tools:  docker compose run --rm --no-deps setup python -m scripts.check
+  setup:
+    <<: *py
+    command: python -m scripts.setup_infra
+    environment:
+      <<: *env
+      FEATURE_MODE: ${FEATURE_MODE:-lambda}
+    volumes: ["./data:/data"]
+    depends_on:
+      localstack: {condition: service_healthy}
+    restart: "no"
+
+  # [5] Decision service, 3 pods
+  decision-service:
+    <<: *py
+    command: uvicorn decision_service.main:app --host 0.0.0.0 --port 9000 --no-access-log
+    volumes: ["./config:/config:ro", "./models:/models:ro"]
+    deploy: {replicas: 3}
+    depends_on:
+      setup: {condition: service_completed_successfully}
+
+  # [4] Front door: HAProxy in TCP mode stands in for the NLB
+  haproxy:
     image: haproxy:2.9-alpine
     ports: ["8080:8080"]
-    volumes: ["./nlb-haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    depends_on: [decision-service]
+
+  # [13] background consumers (case creator, alert sender, label writer)
+  consumers:
+    <<: *py
+    command: python -m consumers.run
     depends_on:
-      decision-service:
-        condition: service_healthy
+      setup: {condition: service_completed_successfully}
+
+  # Only if the Lambda trigger fails on your machine:  FEATURE_MODE=poller docker compose --profile poller up -d --build
+  feature-poller:
+    <<: *py
+    command: python -m feature_updater.poller
+    profiles: ["poller"]
+    depends_on:
+      setup: {condition: service_completed_successfully}

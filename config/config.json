@@ -1,0 +1,21 @@
+{
+  "total_budget_ms": 150,
+  "feature_timeout_ms": 100,
+  "stale_after_s": 600,
+  "stale_bump": 0.05,
+  "rules": {
+    "velocity_max_5m": 10,
+    "large_amount_multiple": 2.5
+  },
+  "ml": {
+    "mode": "live",
+    "model_path": "/models/model_v1.json"
+  },
+  "policy": {
+    "approve_below": 0.70,
+    "decline_above": 0.92
+  },
+  "fallback": {
+    "step_up_amount_minor": 20000
+  }
+}

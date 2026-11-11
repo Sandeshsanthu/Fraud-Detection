@@ -1,0 +1,133 @@
+"""Pure decision logic: features [5] -> rules [7] -> ML [8] -> policy [9]. No AWS, no web framework."""
+#Fradu-Detction/decision_service/engine.py
+import json
+from datetime import datetime
+
+SEVERITY = {"APPROVE": 0, "STEP_UP": 1, "DECLINE": 2}
+WINDOW_S = 300
+
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def worst(a, b):
+    return a if SEVERITY[a] >= SEVERITY[b] else b
+
+
+# ---------- model [8] ----------
+class Model:
+    def __init__(self, bias, weights, version="?"):
+        self.bias, self.weights, self.version = bias, weights, version
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as fh:
+            d = json.load(fh)
+        return cls(d["bias"], d["weights"], d.get("version", "?"))
+
+    @staticmethod
+    def vector(f):
+        return {
+            "count_excess": float(max(f["count_5m"] - 1, 0)),
+            "new_device": 1.0 if f["new_device"] else 0.0,
+            "country_changed": 1.0 if f["country_changed"] else 0.0,
+            "ratio_excess": max(min(f["amount_ratio"], 6.0) - 1.0, 0.0),
+            "tiny_burst": 1.0 if (f["count_5m"] >= 3 and f["tiny"]) else 0.0,
+            "ecom": 1.0 if f["ecom"] else 0.0,
+        }
+
+    def predict(self, f):
+        import math
+        v = self.vector(f)
+        z = self.bias + sum(w * v.get(k, 0.0) for k, w in self.weights.items())
+        return 1.0 / (1.0 + math.exp(-z))
+
+
+# ---------- features [5] ----------
+def build_features(txn, item, local_recent, event_ts, now, cfg):
+    item = item or {}
+    known = set(item.get("known_devices") or [])
+    cold = not known                       # no history for this card: stay neutral, do not call everything "new"
+    seen = {}
+    for ts, eid in item.get("recent", []):  # from DynamoDB (written by the updater, may lag)
+        seen[eid] = ts
+    for ts, eid in local_recent:            # decided by THIS pod a moment ago (covers updater lag)
+        seen.setdefault(eid, ts)
+    seen.pop(txn["transaction_id"], None)
+    count = 1 + sum(1 for ts in seen.values() if event_ts - WINDOW_S <= ts <= event_ts)
+
+    amt_minor = txn["amount_minor"]
+    avg = item.get("avg_amount_30d")
+    ratio = (amt_minor / 100.0) / avg if avg else 1.0
+    country = txn["merchant"]["country"]
+    last_c, last_t = item.get("last_country"), item.get("last_event_ts")
+    changed = bool(last_c and last_c != country and last_t is not None and 0 <= event_ts - last_t <= 900)
+    updated_at = item.get("updated_at")
+    age = (now - updated_at) if updated_at else None
+    return {
+        "count_5m": count,
+        "amount_ratio": round(ratio, 3),
+        "new_device": (not cold) and txn["device_id"] not in known,
+        "country_changed": changed,
+        "tiny": amt_minor < 500,
+        "ecom": txn["channel"] == "ECOM",
+        "cold": cold,
+        "blocked": bool(item.get("blocked")),
+        "feature_age_s": None if age is None else round(age, 1),
+        "stale": age is not None and age > cfg["stale_after_s"],
+    }
+
+
+# ---------- rules [7] ----------
+def evaluate_rules(f, cfg):
+    r = cfg["rules"]
+    if f["blocked"]:
+        return "DECLINE", ["RULE_BLOCKED"]
+    if f["count_5m"] > r["velocity_max_5m"]:
+        return "DECLINE", ["RULE_VELOCITY"]
+    if f["amount_ratio"] > r["large_amount_multiple"] and f["new_device"]:
+        return "STEP_UP", ["RULE_LARGE_NEW_DEVICE"]
+    return "APPROVE", []
+
+
+# ---------- policy [9] ----------
+def policy(score, cfg):
+    p = cfg["policy"]
+    if score < p["approve_below"]:
+        return "APPROVE"
+    if score <= p["decline_above"]:
+        return "STEP_UP"
+    return "DECLINE"
+
+
+def fallback_decision(txn, cfg, reason):
+    """Safe answer when features are unavailable: let small payments through, challenge big ones."""
+    big = txn["amount_minor"] >= cfg["fallback"]["step_up_amount_minor"]
+    return {"decision": "STEP_UP" if big else "APPROVE", "score": None,
+            "reasons": [reason], "features": None, "shadow": None, "fallback": True}
+
+
+def decide_core(txn, item, local_recent, cfg, model, now, skip_ml=False):
+    event_ts = parse_ts(txn["event_time"])
+    f = build_features(txn, item, local_recent, event_ts, now, cfg)
+    rule_dec, reasons = evaluate_rules(f, cfg)
+
+    score = shadow = None
+    if model is not None and not skip_ml:
+        score = model.predict(f)
+        if f["stale"]:
+            score = min(1.0, score + cfg["stale_bump"])   # stale history -> a little more cautious
+        ml_dec = policy(score, cfg)
+        if cfg["ml"]["mode"] == "live":
+            final = worst(rule_dec, ml_dec)
+            if ml_dec != "APPROVE":
+                reasons = reasons + ["ML_" + ml_dec]
+        else:                                              # shadow: score it, never act on it
+            final, shadow = rule_dec, ml_dec
+    else:
+        final = rule_dec
+    if final != "APPROVE" and f["stale"]:
+        reasons = reasons + ["STALE_FEATURES"]
+    return {"decision": final, "score": None if score is None else round(score, 4),
+            "reasons": reasons, "features": f, "shadow": shadow, "fallback": False}

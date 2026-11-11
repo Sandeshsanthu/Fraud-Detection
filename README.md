@@ -21,6 +21,12 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/decide `
 
 
 
-docker compose run --rm --no-deps `
+docker compose run --rm `
   -v "${PWD}/tools:/tools:ro" -v "${PWD}/cards.jsonl:/cards.jsonl:ro" `
-  -e CARDS_FILE=/cards.jsonl decision-service python /tools/seed.py   
+  -e CARDS_FILE=/cards.jsonl decision-service python /tools/seed.py
+
+  python txn_generator.py --tps 100 --duration 60 --seed 42 --speedup 1 --url http://localhost:8080/v1/decide
+
+
+
+  docker compose run --rm -v "${PWD}/tools:/tools:ro" decision-service python /tools/counter.py
