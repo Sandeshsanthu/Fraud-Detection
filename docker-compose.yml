@@ -1,4 +1,4 @@
-#Fraud-Detection/docker-composer.yml
+# Fraud-Detection/docker-compose.yml
 name: fraudlocal            # network becomes fraudlocal_default (LocalStack Lambda joins it)
 
 x-py: &py
@@ -11,12 +11,12 @@ x-py: &py
     PYTHONUNBUFFERED: "1"
 
 services:
-  # Stand-in for AWS: DynamoDB [6], Kinesis [11], Lambda [12], S3 [16], SNS [15]
+  # Stand-in for AWS: DynamoDB, Kinesis, Lambda, S3, SNS, SQS (DLQ)
   localstack:
     image: localstack/localstack:3.8
     ports: ["4566:4566"]
     environment:
-      SERVICES: dynamodb,kinesis,lambda,s3,sns,iam,sts,logs
+      SERVICES: dynamodb,kinesis,lambda,s3,sns,iam,sts,logs,sqs
       LAMBDA_DOCKER_NETWORK: fraudlocal_default
       DEBUG: "0"
     volumes:
@@ -34,7 +34,9 @@ services:
     environment:
       <<: *env
       FEATURE_MODE: ${FEATURE_MODE:-lambda}
-    volumes: ["./data:/data"]
+    volumes:
+      - ./data:/data
+      - ./scripts:/app/scripts
     depends_on:
       localstack: {condition: service_healthy}
     restart: "no"
@@ -42,7 +44,7 @@ services:
   # [5] Decision service, 3 pods
   decision-service:
     <<: *py
-    command: uvicorn decision_service.main:app --host 0.0.0.0 --port 9000 --no-access-log
+    command: uvicorn decision_service.main:app --host 0.0.0.0 --port 9000 --workers 2 --no-access-log
     volumes: ["./config:/config:ro", "./models:/models:ro"]
     deploy: {replicas: 3}
     depends_on:

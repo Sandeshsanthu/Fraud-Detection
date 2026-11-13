@@ -14,7 +14,7 @@ except ImportError:
 
 TABLE = os.environ.get("TABLE_NAME", "card_features")
 _table = None
-
+_DATA_ERRORS = (KeyError, TypeError, ValueError) 
 
 def _endpoint():
     if os.environ.get("DDB_ENDPOINT"):
@@ -69,22 +69,35 @@ def _write(token, it):
 
 
 def lambda_handler(event, context=None):
-    by_card = {}
+    by_card, skipped = {}, 0
     for r in event["Records"]:
-        rec = json.loads(base64.b64decode(r["kinesis"]["data"]))
-        by_card.setdefault(rec["card_token"], []).append(rec)      # arrival order preserved
+        try:
+            rec = json.loads(base64.b64decode(r["kinesis"]["data"]))
+            by_card.setdefault(rec["card_token"], []).append(rec)      # arrival order preserved
+        except _DATA_ERRORS as e:                                      # CHANGED (A4): skip, don't block the shard
+            skipped += 1
+            print(json.dumps({"skipped": r.get("kinesis", {}).get("sequenceNumber"),
+                              "error": f"{type(e).__name__}: {e}"}), flush=True)
     now, applied, dups = time.time(), 0, 0
     for token, recs in by_card.items():
+        # DynamoDB errors are NOT caught: Lambda retries the batch (capped by the mapping settings in setup)
         raw = table().get_item(Key={"card_token": token}, ConsistentRead=True).get("Item")
         item = _from_ddb(raw) if raw else None
         changed = False
         for rec in recs:
-            new = core.compute_update(item, rec, now)
+            try:
+                new = core.compute_update(item, rec, now)
+            except _DATA_ERRORS as e:                                  # CHANGED (A4): e.g. missing event_time
+                skipped += 1
+                print(json.dumps({"skipped": rec.get("event_id"), "error": f"{type(e).__name__}: {e}"}),
+                      flush=True)
+                continue
             if new is None:
                 dups += 1
                 continue
             item, changed, applied = new, True, applied + 1
         if changed:
             _write(token, item)
-    print(json.dumps({"records": len(event["Records"]), "applied": applied, "duplicates": dups}))
-    return {"applied": applied, "duplicates": dups}
+    print(json.dumps({"records": len(event["Records"]), "applied": applied, "duplicates": dups,
+                      "skipped": skipped}))                            # CHANGED (A4)
+    return {"applied": applied, "duplicates": dups, "skipped": skipped}
