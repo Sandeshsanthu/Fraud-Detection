@@ -49,6 +49,10 @@ services:
     deploy: {replicas: 3}
     depends_on:
       setup: {condition: service_completed_successfully}
+    environment:
+      <<: *env
+      STEPUP_SECRET: ${STEPUP_SECRET:-local-dev-placeholder-not-a-real-secret}
+      STEPUP_TEST_OTP: ${STEPUP_TEST_OTP:-123456}
 
   # [4] Front door: HAProxy in TCP mode stands in for the NLB
   haproxy:

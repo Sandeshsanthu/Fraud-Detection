@@ -181,6 +181,8 @@ def main():
     ensure_table(ddb, "cases", "case_id")
     ensure_table(ddb, "alerts", "event_id")
     ensure_table(ddb, "consumer_checkpoints", "consumer_id")
+    ensure_table(ddb, "consumer_checkpoints", "consumer_id")
+    ensure_table(ddb, "stepup_used", "jti", ttl_attr="expires_at")
     arn = ensure_stream(kin)
     s3 = client("s3")
     try:

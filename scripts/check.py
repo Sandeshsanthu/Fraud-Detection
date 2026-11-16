@@ -13,6 +13,17 @@ LABELS = os.environ.get("LABELS_FILE", "/data/labels.jsonl")
 FLAGGED = ("DECLINE", "STEP_UP")
 
 
+def scan_all(table):
+    """A single scan returns at most 1 MB, so keep reading until there are no more pages."""
+    kw, out = {}, []
+    while True:
+        r = table.scan(**kw)
+        out += r["Items"]
+        if "LastEvaluatedKey" not in r:
+            return out
+        kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
+
+
 def main():
     truth = {}
     with open(LABELS) as fh:
@@ -45,7 +56,7 @@ def main():
             scen[(label, sid)].append((tid, flagged, e["decision"]))
     print(f"good customers flagged: {good_flagged}/{good_total} ({good_flagged / max(good_total, 1):.2%})")
 
-    cases = resource("dynamodb").Table("cases").scan()["Items"]
+    cases = [c for c in scan_all(resource("dynamodb").Table("cases")) if "txn_ids" in c]
     t2c = {t: c["case_id"] for c in cases for t in c.get("txn_ids", [])}
     by_label = defaultdict(Counter)
     for (label, sid), rows in scen.items():
@@ -62,7 +73,7 @@ def main():
         extra = {k.replace("flagged_at_payment_no_", "first flag @#"): v for k, v in c.items()
                  if k.startswith("flagged_")}
         print(f"  {label:16s} caught {c['caught']}/{c['total']}   exactly one case {c['exactly_one_case']}/{c['total']}   {extra}")
-    print(f"\ncases in DynamoDB: {len(cases)}   alerts: {len(resource('dynamodb').Table('alerts').scan()['Items'])}")
+    print(f"\ncases in DynamoDB: {len(cases)}   alerts: {len(scan_all(resource('dynamodb').Table('alerts')))}")
 
 
 if __name__ == "__main__":
