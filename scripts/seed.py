@@ -1,3 +1,4 @@
+#scripts/seed.py
 from boto3.dynamodb.conditions import Attr
 from common.aws import resource
 from scripts.setup_infra import TABLE, seed

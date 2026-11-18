@@ -1,8 +1,8 @@
+# Fraud-Detection/scripts/check.py
 """Scenario-level scoreboard after a replay. Joins the generator's secret labels.jsonl with what the system
 actually did (decisions written by the label writer, cases written by the case creator).
   docker compose run --rm --no-deps setup python -m scripts.check
 """
-#Fraud-Detection/scripts/check.py
 import json, os
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -73,7 +73,15 @@ def main():
         extra = {k.replace("flagged_at_payment_no_", "first flag @#"): v for k, v in c.items()
                  if k.startswith("flagged_")}
         print(f"  {label:16s} caught {c['caught']}/{c['total']}   exactly one case {c['exactly_one_case']}/{c['total']}   {extra}")
-    print(f"\ncases in DynamoDB: {len(cases)}   alerts: {len(scan_all(resource('dynamodb').Table('alerts')))}")
+
+    status = Counter(c.get("status", "?") for c in cases)
+    closed = [c for c in cases if c.get("status") == "CLOSED"]
+    # C5: does the analyst's answer agree with the generator's secret labels for the case's payments?
+    disagree = sum((c["outcome"] == "fraud") != any(truth.get(t, ("normal", None))[0] != "normal"
+                                                   for t in c["txn_ids"]) for c in closed)
+    print(f"\ncases in DynamoDB: {len(cases)} {dict(status)}   "
+          f"alerts: {len(scan_all(resource('dynamodb').Table('alerts')))}")
+    print(f"closed by analysts: {len(closed)}   outcome disagrees with truth file: {disagree}")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ POOL_SIZE = 32        # CHANGED: one constant so the thread pool and the slot li
 BREAKER_FAILS = 5     # CHANGED: was 20; now matches the docstring and README
 BREAKER_OPEN_S = 5    # CHANGED: was 2 s
 MAX_ERROR_LOGS = 10   # print the first few store errors in full, then only count them
+BREAKER_RATE = 0.5
+BREAKER_WINDOW_S = 5
 # CHANGED (C4): the same secret on every pod, so any pod can verify a token another pod issued.
 STEPUP_SECRET = os.environ.get("STEPUP_SECRET", "").encode()
 STEPUP_OTP = os.environ.get("STEPUP_TEST_OTP", "")               # stub code; local placeholder only
@@ -62,19 +64,29 @@ class VerifyReq(BaseModel):                                        # CHANGED (C4
 class Breaker:
     """After 5 straight DynamoDB failures stop calling it for 5 s (saves every request 25 ms of waiting)."""
     def __init__(self):
-        self.fails, self.open_until = 0, 0.0
+        self.calls = deque()
+        self.fails = 0
+        self.open_until = 0.0    
 
     def allow(self):
         return time.monotonic() >= self.open_until
 
     def ok(self):
-        self.fails = 0
+        self._record(False)
 
     def fail(self):
-        self.fails += 1
-        if self.fails >= BREAKER_FAILS:                                          # CHANGED
-            self.fails, self.open_until = 0, time.monotonic() + BREAKER_OPEN_S   # CHANGED
+        self._record(True)
 
+    def _record(self, failed):
+        now = time.monotonic()
+        self.calls.append((now, failed))
+        self.fails += failed
+        while self.calls[0][0] < now - BREAKER_WINDOW_S:      # drop calls older than the window
+            self.fails -= self.calls.popleft()[1]
+        if self.fails >= BREAKER_FAILS and self.fails >= BREAKER_RATE * len(self.calls):
+            self.open_until = now + BREAKER_OPEN_S
+            self.calls.clear()                                # start fresh when it reopens
+            self.fails = 0
 
 class State:
     pass

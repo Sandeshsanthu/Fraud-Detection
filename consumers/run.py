@@ -38,17 +38,40 @@ def _actionable(evt):
     return evt["decision"] != "APPROVE" and not evt.get("fallback")
 
 
-def choose_case(ptr, token, ts, window=CASE_WINDOW_S):
-    """CHANGED (C3): pure logic, no AWS. Same case while flags keep arriving less than `window` apart.
-    Otherwise a new case named after THIS event's time, so reprocessing it always gives the same ID."""
-    if ptr and ts - float(ptr["last_flag_ts"]) <= window:      # also true for an older, replayed event
-        return ptr["open_case_id"]
+def new_case_id(token, ts):
+    """Named after the first flag's time, so reprocessing that event always gives the same ID."""
     return f"{token}#{int(ts * 1000)}"
 
 
+def choose_case(ptr, token, ts, window=CASE_WINDOW_S):
+    """C3: same case while flags keep arriving less than `window` apart, otherwise a new one."""
+    if ptr and ts - float(ptr["last_flag_ts"]) <= window:      # also true for an older, replayed event
+        return ptr["open_case_id"]
+    return new_case_id(token, ts)                              # CHANGED (C5): shared helper
+
+
+def _add_to_case(case_id, evt, ts_d):
+    """CHANGED (C5): add the event only if the case is new or still OPEN. False = an analyst closed it."""
+    try:
+        cases.update_item(
+            Key={"case_id": case_id},
+            UpdateExpression="ADD txn_ids :t SET card_token = :c, opened_at = if_not_exists(opened_at, :n), "
+                             "first_flag_ts = if_not_exists(first_flag_ts, :ts), "
+                             "last_decision = :d, last_score = :s, #st = if_not_exists(#st, :o)",
+            ConditionExpression="attribute_not_exists(#st) OR #st = :o",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":t": {evt["event_id"]}, ":c": evt["card_token"], ":n": int(time.time()),
+                                       ":ts": ts_d, ":d": evt["decision"], ":s": str(evt.get("score")),
+                                       ":o": "OPEN"})
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
 def case_creator(evt):
-    """CHANGED (C3): one case per fraud EPISODE per card, not per fixed 30-minute clock slot.
-    A burst that crosses 09:30 now stays one case."""
+    """C3: one case per fraud EPISODE per card. C5: never adds to a case an analyst has closed."""
     if not _actionable(evt):                                   # A3: fallback never opens a case
         return
     token, eid, ts = evt["card_token"], evt["event_id"], _ts(evt)
@@ -57,16 +80,12 @@ def case_creator(evt):
     ptr = cases.get_item(Key={"case_id": f"card#{token}"}, ConsistentRead=True).get("Item")
     case_id, ts_d = choose_case(ptr, token, ts), Decimal(str(round(ts, 3)))
 
-    # Order matters for crash safety: case -> pointer -> index. A crash before the index is written
-    # means the event is processed again, and choose_case sends it back to the same case.
-    cases.update_item(
-        Key={"case_id": case_id},
-        UpdateExpression="ADD txn_ids :t SET card_token = :c, opened_at = if_not_exists(opened_at, :n), "
-                         "first_flag_ts = if_not_exists(first_flag_ts, :ts), "
-                         "last_decision = :d, last_score = :s, #st = if_not_exists(#st, :o)",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={":t": {eid}, ":c": token, ":n": int(time.time()), ":ts": ts_d,
-                                   ":d": evt["decision"], ":s": str(evt.get("score")), ":o": "OPEN"})
+    # Order matters for crash safety: case -> pointer -> index (see C3).
+    if not _add_to_case(case_id, evt, ts_d):                   # CHANGED (C5): pointer led to a CLOSED case
+        case_id = new_case_id(token, ts)                       #   (a close raced with us) -> open a new one
+        if not _add_to_case(case_id, evt, ts_d):               # this event's own case is closed: it was
+            cases.put_item(Item={"case_id": f"evt#{eid}", "case": case_id})   # filed there already; stop
+            return
     try:                                                       # never move the pointer backwards in time
         cases.update_item(Key={"case_id": f"card#{token}"},
                           UpdateExpression="SET open_case_id = :id, last_flag_ts = :ts",
