@@ -9,6 +9,8 @@ x-py: &py
     AWS_ACCESS_KEY_ID: test
     AWS_SECRET_ACCESS_KEY: test
     PYTHONUNBUFFERED: "1"
+    NO_PROXY: "localstack,localhost,127.0.0.1"
+    no_proxy: "localstack,localhost,127.0.0.1"
 
 services:
   # Stand-in for AWS: DynamoDB, Kinesis, Lambda, S3, SNS, SQS (DLQ)
@@ -18,6 +20,8 @@ services:
     environment:
       SERVICES: dynamodb,kinesis,lambda,s3,sns,iam,sts,logs,sqs
       LAMBDA_DOCKER_NETWORK: fraudlocal_default
+      GATEWAY_LISTEN: "0.0.0.0:4566"
+      EAGER_SERVICE_LOADING: "1"
       DEBUG: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
