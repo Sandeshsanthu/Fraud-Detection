@@ -1,8 +1,8 @@
 # Fraud-Detection/docker-compose.yml
-name: fraudlocal            # network becomes fraudlocal_default (LocalStack Lambda joins it)
+name: fraudlocal
 
 x-py: &py
-  build: .
+  image: sandeshs/fraud-detection:a2f321e
   environment: &env
     AWS_ENDPOINT_URL: http://localstack:4566
     AWS_REGION: us-east-1
@@ -27,7 +27,6 @@ services:
       retries: 30
 
   # One-shot: creates tables/stream/bucket/Lambda and seeds cards from data/cards.jsonl.
-  # Also used for tools:  docker compose run --rm --no-deps setup python -m scripts.check
   setup:
     <<: *py
     command: python -m scripts.setup_infra
@@ -37,15 +36,18 @@ services:
     volumes:
       - ./data:/data
       - ./scripts:/app/scripts
+      - ./feature_updater:/app/feature_updater
     depends_on:
       localstack: {condition: service_healthy}
     restart: "no"
 
-  # [5] Decision service, 3 pods
+  # [5] Decision service, 3 pods (runs directly from sandeshs/fraud-detection:a2f321e)
   decision-service:
     <<: *py
     command: uvicorn decision_service.main:app --host 0.0.0.0 --port 9000 --workers 2 --no-access-log
-    volumes: ["./config:/config:ro", "./models:/models:ro"]
+    volumes:
+      - ./config:/config:ro
+      - ./models:/models:ro
     deploy: {replicas: 3}
     depends_on:
       setup: {condition: service_completed_successfully}
@@ -61,17 +63,19 @@ services:
     volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
     depends_on: [decision-service]
 
-  # [13] background consumers (case creator, alert sender, label writer)
+  # [13] Background consumers (runs directly from sandeshs/fraud-detection:a2f321e)
   consumers:
     <<: *py
     command: python -m consumers.run
     depends_on:
       setup: {condition: service_completed_successfully}
 
-  # Only if the Lambda trigger fails on your machine:  FEATURE_MODE=poller docker compose --profile poller up -d --build
+  # Optional poller mode: FEATURE_MODE=poller docker compose --profile poller up -d
   feature-poller:
     <<: *py
     command: python -m feature_updater.poller
     profiles: ["poller"]
+    volumes:
+      - ./feature_updater:/app/feature_updater
     depends_on:
       setup: {condition: service_completed_successfully}
