@@ -1,0 +1,67 @@
+why we are using the dynamodb in fraud detection in payment ? 
+
+1. Single-Digit Millisecond Latency Under Load
+
+• Hard Latency Budget: Your decision-service has a total internal budget of 50 ms (total_budget_ms: 50) and a strict 25 ms cutoff (feature_timeout_ms: 25) to read a card's history.
+• Consistent Speed: DynamoDB delivers predictable 2–8 ms single-item lookups (GetItem by card_token) whether you have 5,000 cards or 500 million cards. Traditional relational databases (like RDS/PostgreSQL) suffer from connection pool exhaustion, lock contention, and tail-latency spikes during high-TPS bursts.
+
+2. Strong Read-After-Write Consistency
+
+• Stopping Velocity Attacks: When a fraudster runs a burst of rapid transactions (fraud_velocity or fraud_testing), the feature updater writes the updated 5-minute transaction count and last_country to card_features, and the very next request seconds later reads it with ConsistentRead=True (in decision_service/main.py).
+• Why Not Pure Caching (Redis/ElastiCache) Alone? While Redis is fast, it is an in-memory cache where node failovers or evictions can lose state (such as blocked: true or stepup_used nonces). DynamoDB persists every write durably across multiple Availability Zones while still offering strongly consistent reads.
+
+3. Atomic Conditional Writes (Preventing Race Conditions)
+
+Your codebase relies heavily on DynamoDB's ConditionExpression to prevent race conditions across concurrent EKS pods and consumers without distributed locks:
+• One-Time 3DS OTP Challenges (stepup_used): In decision_service/main.py, ConditionExpression="attribute_not_exists(jti)" guarantees a challenge token can only be redeemed once, blocking replay attacks.
+• Concurrent Case Closing (cases): In scripts/close_case.py and consumers/run.py, conditional expressions ensure that once an analyst closes a case as fraud or not_fraud, a racing consumer pod cannot append new transactions to that closed case.
+• Idempotent Alerts (alerts): Prevents sending duplicate SMS/SNS alerts if a Kinesis batch is retried.
+
+4. Built-In TTL (Time-To-Live) & Serverless Auto-Scaling
+
+• Automatic Data Expiry: Tables like card_features and stepup_used use DynamoDB's native expires_at TTL attribute to automatically delete expired OTP tokens and stale card profiles with zero background cleanup jobs or database vacuuming.
+• Zero Connection Management: Over HTTPS/IAM (IRSA), hundreds of EKS pods and Lambda workers can read and write concurrently without managing TCP connection pools or worrying about hitting max_connections limits.
+
+
+
+why are we using amazon Kinesis in fraud detection in payment ? 
+
+
+Why Kinesis Was Chosen (And What Your Script Does)
+
+• Decoupling the 50 ms Payment Path: When a card swipe hits decision-service, the pod must reply in under 50 ms. Instead of waiting for DynamoDB feature counters to update, cases to open, SNS alerts to send, and S3 logs to write, the pod fires a single async event into Kinesis (Publisher in decision_service/publisher.py) and immediately responds to the payment switch.
+• Fan-Out to Multiple Independent Consumers: One Kinesis stream feeds four separate downstream jobs simultaneously without duplicating network calls inside decision-service:
+	1. feature_updater Lambda/Flink (updates 5-minute velocity and last country in DynamoDB ``)
+	2. case_creator consumer (opens fraud cases in DynamoDB ``)
+	3. alert_sender consumer (sends 3DS/fraud notifications via SNS ``)
+	4. label_writer consumer (stores point-in-time features in S3 `` for SageMaker training)
+• Strict Per-Card Ordering (PartitionKey = card_token): Kinesis routes all events with the same partition key (card_token) to the exact same shard in strict chronological order. This ensures your velocity counter and impossible-travel logic always process a card's transactions in the exact sequence they occurred.
+• Replayability & Failure Recovery: Unlike a simple queue where messages vanish once read, Kinesis retains events for 24 hours to 365 days (RetentionHours). Your consumers/run.py tracks its own SequenceNumber in consumer_checkpoints, meaning if a consumer crashes or you deploy a new consumer later, it can replay historical events safely.
+
+2. What Your create-payment-stream.sh Script Configures
+
+• StreamMode=ON_DEMAND: Automatically scales read/write capacity up and down with payment traffic spikes—no manual shard splitting or merging required.
+• start-stream-encryption --encryption-type KMS --key-id alias/aws/kinesis: Encrypts all payment event payloads at rest using AWS KMS, which is essential for PCI-DSS compliance and protecting card tokens and transaction metadata.
+
+3. Kinesis vs. Other Messaging Services (SQS, Kafka/MSK, EventBridge)
+
+
+Service	Why It Was or Wasn't Chosen Here
+Amazon Kinesis (Chosen)	Built for ordered, high-throughput streaming with multiple independent readers (Lambda + EKS consumers) reading the same events and replaying from checkpoints.
+Amazon SQS	Great for simple work queues, but Standard SQS does not guarantee strict ordering across shards, and each message is deleted after one consumer reads it (requiring SNS+SQS fan-out setups for multiple consumers).
+Apache Kafka / Amazon MSK	Offers similar ordered streaming and fan-out, but requires managing brokers, ZooKeeper/KRaft clusters, and TLS/SASL networking. Kinesis ON_DEMAND is completely serverless and authenticates natively via IAM/IRSA.
+Amazon EventBridge	Best for low-volume business rules and SaaS event routing, not high-TPS ordered transaction streams where sub-second batching and shard-level ordering matter.
+
+
+
+
+why SQS ? 
+
+Why do we need it?
+If Lambda cannot process Kinesis records—for example, because DynamoDB is unavailable—it retries. After the configured retry or record-age limit is reached, its Kinesis event-source mapping can send failure information to this queue.
+The eventual connections will be:
+
+Success: Kinesis → Lambda → DynamoDB
+Exhausted processing failure: Kinesis event-source mapping → SQS failure queue
+
+Important: this SQS destination receives failure metadata, not the complete original payment records. Recovering the original records depends on them still being available in Kinesis.

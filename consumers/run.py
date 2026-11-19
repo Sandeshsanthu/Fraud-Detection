@@ -150,3 +150,41 @@ if __name__ == "__main__":
         t.start()
     while True:
         time.sleep(3600)
+
+
+
+# ==============================================================================
+# The Three Workers & Their Jobs
+# ==============================================================================
+
+# A. case_creator (Fraud Investigation Cases)
+# ------------------------------------------------------------------------------
+# - Filters noise: Ignores APPROVE decisions and fallback decisions (_actionable).
+#   A fallback STEP_UP happens when the database times out, so it shouldn't
+#   trigger a human fraud investigation.
+# - Groups episodes: Groups multiple suspicious flags on the same card into one
+#   case as long as they arrive within 30 minutes (CASE_WINDOW_S = 1800) of each other.
+# - Respects closed cases: If an analyst already closed a case (status != OPEN),
+#   _add_to_case refuses to reopen it and automatically creates a brand-new case
+#   ID ({token}#{timestamp_ms}).
+# - Crash-safe order: Writes in a strict sequence—Case row -> Card pointer ->
+#   Event index (evt#{id})—so if the process crashes mid-write, replaying the
+#   event recovers cleanly without losing data or double-counting.
+
+# B. alert_sender (Customer SMS/Push Alerts)
+# ------------------------------------------------------------------------------
+# - Two-phase commit (PENDING -> SENT):
+#   1. First, it claims the event in DynamoDB with status = "PENDING" (if it is
+#      already "SENT", it exits immediately to prevent duplicate texts).
+#   2. Next, it publishes a "Was this you?" message to the SNS topic (fraud-alerts).
+#   3. Finally, it updates DynamoDB to status = "SENT".
+# - Crash safety: If SNS fails or crashes mid-send, the row stays "PENDING",
+#   allowing the next retry to safely send the alert instead of skipping it forever.
+
+# C. label_writer (ML Training Data Archiver)
+# ------------------------------------------------------------------------------
+# - Logs every decision: Unlike the other two workers, it saves all events—including
+#   APPROVE and fallback decisions—to S3 (s3://fraud-labels/decisions/{event_id}.json).
+# - Point-in-time accuracy: Stores the exact card features seen at payment time
+#   so future ML models can train without data leakage. Using event_id as the
+#   filename ensures duplicate deliveries simply overwrite the same file.
