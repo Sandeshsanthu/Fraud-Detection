@@ -65,3 +65,25 @@ Success: Kinesis → Lambda → DynamoDB
 Exhausted processing failure: Kinesis event-source mapping → SQS failure queue
 
 Important: this SQS destination receives failure metadata, not the complete original payment records. Recovering the original records depends on them still being available in Kinesis.
+
+
+
+lambda ?  
+
+
+
+
+
+
+
+
+
+
+ Why 1 Trigger Creates 3 Records in cases (Single-Table Design)
+
+In consumers/run.py, case_creator uses a DynamoDB single-table design with three distinct key prefixes (<token>#<ts>, evt#<id>, and card#<token>) to solve three distributed-system problems without needing secondary indexes or distributed locks:
+
+Record Key (case_id)	Purpose	What It Prevents
+tok_9d79b1...#1795169208000 (The Actual Case)	Stores the fraud case details (status: OPEN, last_decision: DECLINE, last_score: 0.9409, and the set of flagged txn_ids).	Gives fraud analysts a single case view containing all related bad transactions.
+evt#9e06caa2-4a40-... (Event Deduplication Index)	Maps each transaction event_id to the case it was filed under.	Prevents duplicate processing: If Kinesis retries or replays the same event, case_creator sees evt#... already exists and skips it immediately.
+card#tok_9d79b1... (Active Episode Pointer)	Tracks the card's currently OPEN case (open_case_id) and last_flag_ts.	Groups rapid attacks into one case: If the fraudster makes 5 more bad attempts within 30 minutes (CASE_WINDOW_S = 1800), case_creator appends them to this existing OPEN case instead of flooding analysts with 6 separate cases. (Deleted automatically when an analyst closes the case.)

@@ -1,0 +1,186 @@
+
+Known device, normal amount ($20.00), home country (US):
+
+TID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl -sS -X POST http://localhost:8080/v1/decide \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $TID" \
+  -d "{
+    \"schema_version\": \"1.0\",
+    \"transaction_id\": \"$TID\",
+    \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+    \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+    \"card_bin\": \"999001\",
+    \"amount_minor\": 2000,
+    \"currency\": \"USD\",
+    \"channel\": \"POS\",
+    \"entry_mode\": \"chip\",
+    \"merchant\": {\"id\": \"m_00001\", \"mcc\": \"5411\", \"country\": \"US\"},
+    \"device_id\": \"dev_9d79b1a3_a\"
+  }" | python3 -m json.tool
+
+
+
+ High Amount on Unknown Device (STEP_UP -> RULE_LARGE_NEW_DEVICE)
+
+Triggers 3DS OTP challenge and returns challenge_token:
+
+TID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl -sS -X POST http://localhost:8080/v1/decide \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $TID" \
+  -d "{
+    \"schema_version\": \"1.0\",
+    \"transaction_id\": \"$TID\",
+    \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+    \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+    \"card_bin\": \"999001\",
+    \"amount_minor\": 25000,
+    \"currency\": \"USD\",
+    \"channel\": \"ECOM\",
+    \"entry_mode\": \"ecom\",
+    \"merchant\": {\"id\": \"m_00002\", \"mcc\": \"7995\", \"country\": \"US\"},
+    \"device_id\": \"dev_unknown_new_1\"
+  }" | tee /tmp/stepup.json | python3 -m json.tool
+
+
+
+ Verify 3DS OTP (/v1/stepup/verify)
+
+Submits the OTP (123456) using the challenge_token from step 2 (run a second time to test replay rejection):
+
+TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/stepup.json'))['challenge_token'])")
+curl -sS -X POST http://localhost:8080/v1/stepup/verify \
+  -H "Content-Type: application/json" \
+  -d "{\"token\": \"$TOKEN\", \"otp\": \"123456\"}" | python3 -m json.tool
+
+
+
+Impossible Travel + High Amount (DECLINE -> RULE_IMPOSSIBLE_TRAVEL & ML_DECLINE)
+
+Country switches from US to NG on an unseen device:
+
+TID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl -sS -X POST http://localhost:8080/v1/decide \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $TID" \
+  -d "{
+    \"schema_version\": \"1.0\",
+    \"transaction_id\": \"$TID\",
+    \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+    \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+    \"card_bin\": \"999001\",
+    \"amount_minor\": 100000,
+    \"currency\": \"USD\",
+    \"channel\": \"ECOM\",
+    \"entry_mode\": \"ecom\",
+    \"merchant\": {\"id\": \"m_00002\", \"mcc\": \"7995\", \"country\": \"NG\"},
+    \"device_id\": \"dev_foreign_hacker\"
+  }" | python3 -m json.tool
+
+
+
+Card Testing Burst (DECLINE -> RULE_CARD_TESTING)
+
+Run this exact command 3 times in a row (amount_minor: 150 = $1.50 online); the 3rd swipe triggers RULE_CARD_TESTING:
+
+TID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl -sS -X POST http://localhost:8080/v1/decide \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $TID" \
+  -d "{
+    \"schema_version\": \"1.0\",
+    \"transaction_id\": \"$TID\",
+    \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+    \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+    \"card_bin\": \"999001\",
+    \"amount_minor\": 150,
+    \"currency\": \"USD\",
+    \"channel\": \"ECOM\",
+    \"entry_mode\": \"ecom\",
+    \"merchant\": {\"id\": \"m_00003\", \"mcc\": \"5411\", \"country\": \"US\"},
+    \"device_id\": \"dev_9d79b1a3_a\"
+  }" | python3 -m json.tool
+
+
+
+High-Velocity Burst (DECLINE -> RULE_VELOCITY)
+
+Run this command 11 times in a row; the 11th swipe exceeds velocity_max_5m: 10 and triggers RULE_VELOCITY:
+
+for i in {1..11}; do
+  TID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  echo "--- Swipe $i ---"
+  curl -sS -X POST http://localhost:8080/v1/decide \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $TID" \
+    -d "{
+      \"schema_version\": \"1.0\",
+      \"transaction_id\": \"$TID\",
+      \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+      \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+      \"card_bin\": \"999001\",
+      \"amount_minor\": 1500,
+      \"currency\": \"USD\",
+      \"channel\": \"POS\",
+      \"entry_mode\": \"chip\",
+      \"merchant\": {\"id\": \"m_00001\", \"mcc\": \"5411\", \"country\": \"US\"},
+      \"device_id\": \"dev_9d79b1a3_a\"
+    }" | python3 -m json.tool
+done
+
+
+
+
+7. Idempotency Check (Duplicate Idempotency-Key)
+
+Sending the exact same Idempotency-Key twice returns the cached first response without re-running rules or ML:
+
+FIXED_ID="99999999-9999-4999-8999-999999999999"
+curl -sS -X POST http://localhost:8080/v1/decide \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $FIXED_ID" \
+  -d "{
+    \"schema_version\": \"1.0\",
+    \"transaction_id\": \"$FIXED_ID\",
+    \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
+    \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
+    \"card_bin\": \"999001\",
+    \"amount_minor\": 2000,
+    \"currency\": \"USD\",
+    \"channel\": \"POS\",
+    \"entry_mode\": \"chip\",
+    \"merchant\": {\"id\": \"m_00001\", \"mcc\": \"5411\", \"country\": \"US\"},
+    \"device_id\": \"dev_9d79b1a3_a\"
+  }" | python3 -m json.tool
+
+
+
+export TOKEN="tok_9d79b1a37f31801cd11a6706"
+export LABEL_BUCKET="fraud-labels-215409407944-us-east-1"
+
+# 1. Inspect cases & alerts created by the Kinesis consumers
+aws dynamodb scan --table-name cases --region us-east-1
+aws dynamodb scan --table-name alerts --region us-east-1
+
+# 2. List open cases via the analyst CLI
+CASE_LIST=$(python3 -m scripts.close_case --list)
+echo "$CASE_LIST"
+
+# 3. Close the first open case for this card as 'fraud'
+CASE_ID=$(echo "$CASE_LIST" | grep -E "^${TOKEN}#" | head -n 1 | awk '{print $1}' || true)
+if [[ -n "$CASE_ID" ]]; then
+  echo "Closing Case: $CASE_ID"
+  python3 -m scripts.close_case "$CASE_ID" fraud --analyst a.analyst
+
+  # Test idempotent rerun (should succeed cleanly)
+  python3 -m scripts.close_case "$CASE_ID" fraud --analyst a.analyst
+
+  # Test conflicting outcome (should be refused)
+  python3 -m scripts.close_case "$CASE_ID" not_fraud --analyst b.analyst || true
+
+  # 4. Confirm disposition landed in S3
+  aws s3 ls "s3://${LABEL_BUCKET}/dispositions/" --region us-east-1
+else
+  echo "No open cases found for $TOKEN"
+fi
