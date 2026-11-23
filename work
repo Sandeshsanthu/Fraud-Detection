@@ -184,3 +184,33 @@ if [[ -n "$CASE_ID" ]]; then
 else
   echo "No open cases found for $TOKEN"
 fi
+
+
+
+python3 -m scripts.evaluate_ml_gate \
+  --dataset "$HOME/fraud-aws-setup/ml-dataset-76hiyh33/dataset.jsonl" \
+  --training-dir "$HOME/fraud-aws-setup/ml-training-c2qoo73y" \
+  --baseline "$HOME/Fraud-Detection/models/model_v1.json" \
+  --config "$HOME/Fraud-Detection/config/config.json"
+
+
+
+  python3 -m scripts.evaluate_ml_challenges \
+  --dataset "$HOME/fraud-aws-setup/ml-challenges-nnitdef2/challenge.jsonl" \
+  --training-dir "$HOME/fraud-aws-setup/ml-training-c2qoo73y" \
+  --baseline "$HOME/Fraud-Detection/models/model_v1.json" \
+  --config "$HOME/Fraud-Detection/config/config.json"
+
+
+  python3 -m scripts.train_v3 \
+  --dataset "$HOME/fraud-aws-setup/ml-dataset-w4mtsl4k/dataset.jsonl" \
+  --coverage "$HOME/fraud-aws-setup/ml-balanced-9h1euton/coverage.jsonl"
+
+
+  python3 -m scripts.evaluate_v3 \
+  --dataset "$HOME/fraud-aws-setup/ml-dataset-w4mtsl4k/dataset.jsonl" \
+  --coverage "$HOME/fraud-aws-setup/ml-balanced-9h1euton/coverage.jsonl" \
+  --training-dir "$HOME/fraud-aws-setup/ml-v3-training-74c2ka4f" \
+  --baseline "$HOME/Fraud-Detection/models/model_v1.json" \
+  --challenge "$HOME/fraud-aws-setup/ml-challenges-nnitdef2/challenge.jsonl" \
+  --config "$HOME/Fraud-Detection/config/config.json"
