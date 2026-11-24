@@ -1,0 +1,1079 @@
+Today’s work — complete handover notes
+We can pause here safely. The latest milestone is complete: the separate SageMaker batch image built successfully, and all 10 training/evaluation tests passed inside it.
+These notes cover the work recorded in this conversation. Some shell filenames were labels for commands pasted into the terminal—not necessarily files saved on disk.
+
+1. Current state at the stopping point
+
+
+
+Area
+Current state
+
+
+
+
+Original application
+Still running on 8080, using the original serving image
+
+
+Experimental canary
+Running on 8081
+
+
+Active model
+V1
+
+
+Candidate model
+V3-experimental, observation-only
+
+
+V2
+Preserved as an experiment that failed the new-device regression test
+
+
+Shadow S3 reload
+Verified, including replacement/restoration on both workers
+
+
+Shadow continuity
+150 requests completed and persisted, zero observed failures
+
+
+Active-model loader
+Implemented, offline-tested, integrated into the canary
+
+
+Active test authorization
+Canary configured to authorize original v1 and the identity-only v1 test artifact
+
+
+Active live replacement test
+Not yet completed against real S3
+
+
+Dataset preparation
+Label resolution, dataset packaging, temporal splitting implemented and locally tested
+
+
+SageMaker trainer/evaluator
+Implemented and tested locally and inside the batch image
+
+
+SageMaker execution role
+Created
+
+
+SageMaker batch image
+Built and passed 10 tests
+
+
+ECR repository/push
+Not done yet
+
+
+SageMaker Pipeline / Registry registration
+Not implemented yet
+
+
+EventBridge/Lambda promotion
+Not implemented yet
+
+
+EKS
+Future migration—not needed for current work
+
+
+
+No SageMaker training/processing jobs were launched, and v3 was not promoted.
+
+2. What we did
+A. Investigated the original training failure
+
+The original collection contained 289 payments, but only four independent fraud groups.
+All fraud examples landed in training, leaving validation with only normal transactions.
+We retained grouped separation and collected additional independent synthetic scenarios instead of searching random seeds for a convenient split.
+
+B. Trained and evaluated v2
+
+Collected 300 payments, all matched to archived decision snapshots.
+Trained v2 with scenario-aware grouped splits.
+Verified exported JSON predictions matched scikit-learn.
+V2 improved the original synthetic test recall.
+A separate challenge dataset exposed a regression: all five legitimate new-device examples were flagged.
+V2 promotion was blocked.
+
+C. Collected richer data and trained v3
+
+Collected 444 payments across 96 independent scenario groups.
+Included legitimate new-device transactions and fraud using trusted devices.
+Preserved subtype/device-treatment coverage across splits.
+Trained v3 with 296 training, 74 validation, and 74 test payments.
+V3 flagged 52/58 test fraud payments, compared with v1’s 33/58.
+Neither flagged the 16 normal test payments.
+V3 avoided the known v2 new-device regression.
+These remain limited, fraud-heavy synthetic results—not production qualification.
+
+D. Added candidate-only shadow scoring
+
+Kept v1 responsible for actual decisions.
+Added v3 scores, identity, checksum, simulated decisions, status, and inference duration to published decision events.
+Preserved the active API result.
+Deployed an isolated canary on 8081, outside the original HAProxy path.
+Verified one request end-to-end through S3, then a 12-request batch.
+
+E. Implemented candidate S3 hot reload
+
+Created checksum-addressed model releases and a separate shadow manifest.
+Implemented bounded downloads, checksum/version validation, background polling, and last-known-good retention.
+Verified a real S3 artifact download.
+Switched to an identity-only candidate test version and restored the original.
+Added worker identities.
+Verified both same workers observed replacement and restoration without restarting.
+Ran the 150-request continuity test successfully.
+
+F. Prepared promotion evidence
+
+Created a local checksum-bound review record.
+Bound it to model, baseline, dataset, configuration, and evaluation evidence.
+Left review status pending and promotion false.
+
+G. Implemented active-model loading
+
+Added a separate active manifest contract.
+Added immutable snapshots and checksum authorization.
+Captured one model snapshot per request for scoring and event identity.
+Tested v1 scoring parity, invalid-artifact rejection, concurrent refresh behavior, and shutdown.
+Published the original v1 release.
+Enabled active polling on the canary.
+Verified both workers used the exact original v1 checksum.
+Prepared an identical-coefficient v1-reload-test artifact.
+Added optional authorization for its checksum.
+Verified replacement and rollback offline inside the built image.
+Uploaded that test artifact and enabled its authorization on the canary.
+Real active-pointer switching and rollback remain outstanding.
+
+H. Started the SageMaker data and training foundation
+
+Added UTC-partitioned decision serialization.
+Added backward-compatible partitioned and legacy writes.
+Implemented as-of feedback resolution.
+Implemented archived-feature/label joins with maturity and cutoff checks.
+Added checksum-bound processing bundles.
+Added chronological train/validation/test preparation with separate label-availability cutoffs.
+Added SageMaker-compatible training and baseline-comparison evaluation.
+Created the dedicated execution role.
+Built a separate batch image and passed all 10 training/evaluation tests inside it.
+
+
+3. Python files — purpose of each
+Existing application and infrastructure files inspected
+
+
+
+File
+One-line purpose
+
+
+
+
+txn_generator.py
+Generates synthetic normal/fraud payment scenarios, truth files, card fixtures, and optional API replay.
+
+
+common/aws.py
+Constructs AWS clients/resources using configured endpoints, timeouts, retries, and the credential chain.
+
+
+common/kinesis_reader.py
+Provides stream reading/checkpoint behavior used by consumers; its implementation was not fully reviewed here.
+
+
+decision_service/main.py
+Hosts the API and integrates active scoring, candidate observation, model identity, worker identity, and reload lifecycle.
+
+
+decision_service/engine.py
+Builds inference features and implements model scoring, rules, policy thresholds, and fallback decisions.
+
+
+decision_service/config.py
+Reloads local JSON configuration while retaining the previous configuration on supported loading failures.
+
+
+decision_service/store.py
+Converts stored DynamoDB feature records into the application’s feature-history representation.
+
+
+decision_service/publisher.py
+Publishes decision events asynchronously to Kinesis.
+
+
+decision_service/stepup.py
+Signs/verifies step-up challenges and implements the sandbox OTP check.
+
+
+consumers/run.py
+Runs case creation, alerts, and decision archival consumers; host source was patched for partitioned writes.
+
+
+scripts/setup_infra.py
+Existing LocalStack-oriented setup and synthetic-card seeding utility; not used to recreate AWS infrastructure.
+
+
+scripts/close_case.py
+Closes analyst cases and writes disposition records.
+
+
+scripts/shadow_report.py
+Existing decision-comparison reporting utility; not yet a complete Registry promotion gate.
+
+
+scripts/build_ml_dataset.py
+Joins synthetic truth with archived decision snapshots for the earlier local experiments.
+
+
+
+ML collection, training, and evaluation files
+
+
+
+File
+One-line purpose
+
+
+
+
+scripts/train_local.py
+Trains the preserved v2 synthetic experiment with grouped scenario-aware splitting.
+
+
+scripts/collect_ml_data.py
+Collects fresh synthetic v2-development traffic with new identities and current timestamps.
+
+
+scripts/evaluate_ml_gate.py
+Compares raw baseline/candidate ML scores on a reserved test set and exposes helpers reused elsewhere.
+
+
+scripts/collect_ml_challenges.py
+Collects controlled challenge cases targeting synthetic shortcuts and trusted-device fraud.
+
+
+scripts/evaluate_ml_challenges.py
+Evaluates the original candidate against the challenge set using ML-only and simulated combined decisions.
+
+
+scripts/collect_ml_balanced.py
+Collects richer v3-development scenarios with legitimate device changes and trusted/unknown-device fraud.
+
+
+scripts/train_v3.py
+Trains the preserved v3 synthetic experiment with subtype/device-stratified scenario groups.
+
+
+scripts/evaluate_v3.py
+Compares v1/v3 on the reserved test and known regression suite.
+
+
+scripts/prepare_promotion_review.py
+Creates a local checksum-bound evidence inventory with approval explicitly pending.
+
+
+
+Keep evaluate_ml_gate.py: evaluate_v3.py imports from it. Do not delete v2 evidence merely because v3 exists.
+Serving/reload files added
+
+
+
+File
+One-line purpose
+
+
+
+
+decision_service/candidate.py
+Loads a local candidate and produces observation-only scoring fields without intentionally changing the active result.
+
+
+decision_service/candidate_loader.py
+Polls the shadow manifest, validates replacements, and retains the last valid candidate on refresh failure.
+
+
+decision_service/active_loader.py
+Loads explicitly authorized active-model snapshots from the separate live manifest.
+
+
+scripts/verify_shadow_batch.py
+Checks 12 synthetic canary requests against stored events and offline scoring.
+
+
+scripts/verify_shadow_workers.py
+Establishes two worker identities from persisted candidate-scoring events.
+
+
+scripts/verify_worker_reload.py
+Verifies both identified workers observe candidate replacement and restoration.
+
+
+scripts/test_reload_continuity.py
+Records 150 requests and checks persistence, worker coverage, errors, and latency during candidate reload.
+
+
+scripts/verify_active_v1.py
+Verifies both current canary workers use the exact v1 checksum and match offline scoring.
+
+
+
+SageMaker data and batch files added
+
+
+
+File
+One-line purpose
+
+
+
+
+consumers/decision_archive.py
+Validates event metadata and serializes preserved snapshots into UTC date-partitioned keys.
+
+
+consumers/decision_writer.py
+Writes identical decision bodies to partitioned and legacy keys during migration.
+
+
+common/label_resolver.py
+Resolves normalized feedback by availability cutoff, source precedence, revisions, and conflicts.
+
+
+common/training_dataset.py
+Adapts analyst feedback and joins eligible labels to archived inference features.
+
+
+scripts/process_training_dataset.py
+Packages prepared rows, input copies, eligibility counts, and checksum metadata.
+
+
+common/temporal_dataset.py
+Builds chronological splits with separate historical label cutoffs.
+
+
+scripts/train_sagemaker.py
+Trains from prepared channels and exports JSON weights plus training lineage.
+
+
+scripts/evaluate_sagemaker.py
+Checks test separation/lineage and compares candidate versus baseline ML recall/FPR.
+
+
+
+The dataset/evaluation checks are experimental controls, not a complete production leakage or promotion-control system.
+
+4. Test files
+
+
+
+File
+One-line purpose
+Confirmed result
+
+
+
+
+tests/test_candidate_loader_failures.py
+Tests failed refresh retention, inference availability, and background lifecycle.
+5 passed
+
+
+tests/test_active_loader.py
+Tests authorization, corruption rejection, snapshot retention, and immutable weights.
+5 passed
+
+
+tests/test_active_loader_runtime.py
+Tests v1 scoring parity, network failures, concurrent reads, and shutdown.
+4 passed
+
+
+tests/test_decision_archive.py
+Tests UTC partitioning, snapshot preservation, and malformed-event rejection.
+7 passed
+
+
+tests/test_decision_writer.py
+Tests dual writes, partial failure propagation, and retry completion.
+3 passed
+
+
+tests/test_label_resolver.py
+Tests precedence, delayed availability, conflicts, duplicates, and OTP exclusion from truth.
+10 passed
+
+
+tests/test_training_dataset.py
+Tests archived-feature joins, maturity, cutoffs, duplicates, and unknown-label exclusion.
+8 passed
+
+
+tests/test_processing_bundle.py
+Tests bundle hashes, no-overwrite behavior, and insufficient-class rejection.
+2 passed
+
+
+tests/test_temporal_dataset.py
+Tests chronological splits and future-feedback exclusion.
+4 passed
+
+
+tests/test_sagemaker_training.py
+Tests training/export, chronological ordering, overlap, and invalid inputs.
+5 passed
+
+
+tests/test_sagemaker_evaluation.py
+Tests recall/FPR gates, invalid probabilities, and training-to-evaluation lineage.
+5 passed
+
+
+tests/test_stepup.py
+Existing challenge verification, replay, expiry, blocked-card, and OTP tests.
+Inventory inspected; not rerun here
+
+
+
+Latest batch-image result: 10 training/evaluation tests passed in 0.062 seconds.
+
+5. Docker, Compose, and configuration files
+
+
+
+File
+One-line purpose
+
+
+
+
+Dockerfile
+Existing API/consumer image definition; starts Uvicorn and does not include the batch scripts.
+
+
+Dockerfile.sagemaker
+New separate Python batch image containing processing, training, and evaluation modules.
+
+
+compose-aws.yaml
+Original AWS Docker deployment with decision-service replicas, HAProxy, and consumers on 8080.
+
+
+compose-shadow-canary.yaml
+Defines the isolated 8081 canary with v1 active and locally mounted v3 candidate.
+
+
+compose-shadow-s3.yaml
+Enables candidate S3 polling and selects the S3-capable canary image.
+
+
+compose-shadow-workers.yaml
+Selects the image that records worker identity.
+
+
+compose-active-v1.yaml
+Enables active polling with the original v1 checksum.
+
+
+compose-active-reload-test.yaml
+Selects the active-test image and authorizes the identity-only v1 test checksum.
+
+
+config/config.json
+Holds model mode/path, policy thresholds, rules, budgets, and fallback settings.
+
+
+haproxy.cfg
+Routes original 8080 traffic across decision containers with health checks.
+
+
+requirements.txt
+Existing serving-image Python dependency list.
+
+
+docker-compose.yml
+Existing local Compose configuration; not replaced during this work.
+
+
+
+Images built during the work
+
+fraud-detection:v3-shadow-experimental
+fraud-detection:v3-shadow-s3-experimental
+fraud-detection:v3-shadow-workers-experimental
+fraud-detection:active-loader-experimental
+fraud-detection:active-reload-test-experimental
+fraud-learning:sagemaker-experimental — latest batch image
+
+The original application continues using sandeshs/fraud-detection:a2f321e.
+
+6. Shell scripts / command-block filenames
+Some entries below were terminal command blocks rather than confirmed saved scripts.
+Collection and experiment commands
+
+
+
+Filename
+One-line purpose
+
+
+
+
+inspect-ml-groups.sh
+Counts independent connected card/scenario groups.
+
+
+inspect-ml-traffic-generator.sh
+Inspects generator arguments and source before changing collection.
+
+
+collect-fresh-ml-data.sh
+Runs the first independent-scenario collector.
+
+
+train-v2-experiment.sh
+Runs the v2 trainer.
+
+
+evaluate-v2-gate.sh
+Runs the v2 reserved-test comparison.
+
+
+run-ml-challenges.sh
+Collects challenge transactions.
+
+
+run-challenge-evaluation.sh
+Runs the original challenge evaluation.
+
+
+run-balanced-collection.sh
+Collects richer v3 data.
+
+
+run-v3-training.sh
+Runs v3 training.
+
+
+run-v3-evaluation.sh
+Runs v3 test/regression evaluation.
+
+
+
+Candidate deployment and reload commands
+
+
+
+Filename
+One-line purpose
+
+
+
+
+integrate-candidate-scoring.sh
+Patches candidate observation into the API.
+
+
+build-shadow-image.sh
+Builds the first shadow image.
+
+
+test-shadow-image.sh
+Tests candidate scoring offline inside the image.
+
+
+inspect-shadow-rollout.sh
+Inspects Dockerfile and HAProxy configuration.
+
+
+start-shadow-canary.sh
+Starts/checks the isolated canary.
+
+
+verify-canary-shadow.sh
+Verifies one candidate-scored request through S3.
+
+
+run-shadow-batch.sh
+Runs the 12-request batch verifier.
+
+
+prepare-shadow-release.sh
+Creates the local checksum-addressed candidate release.
+
+
+check-model-bucket.sh
+Checks models-bucket accessibility.
+
+
+publish-shadow-release.sh
+Conditionally uploads the candidate artifact and shadow manifest.
+
+
+run-publish-shadow-release.sh
+Runs candidate release publication.
+
+
+test-candidate-loader.sh
+Tests fake-S3 replacement and last-known-good retention.
+
+
+integrate-candidate-loader.sh
+Connects candidate polling to application lifecycle and metrics.
+
+
+run-loader-integration.sh
+Runs that integration patch.
+
+
+build-s3-shadow-image.sh
+Builds/import-checks the S3 candidate image.
+
+
+enable-canary-s3-reload.sh
+Deploys the candidate S3-polling canary.
+
+
+verify-s3-candidate-download.sh
+Forces a real S3 download in a separate test container.
+
+
+prepare-reload-test.sh
+Prepares/uploads an identity-only candidate test artifact.
+
+
+run-prepare-reload-test.sh
+Runs candidate test-release preparation.
+
+
+test-canary-hot-reload.sh
+Switches the shadow pointer, verifies use, and restores it.
+
+
+run-canary-hot-reload-test.sh
+Runs the sampled candidate reload test.
+
+
+run-loader-failure-tests.sh
+Runs offline candidate failure tests.
+
+
+instrument-canary-workers.sh
+Adds worker identity to published events.
+
+
+build-worker-observation-image.sh
+Builds the worker-instrumented image.
+
+
+deploy-worker-observation.sh
+Deploys that image to the canary.
+
+
+run-shadow-worker-check.sh
+Establishes both worker identities.
+
+
+run-worker-reload-verification.sh
+Runs both-worker replacement/restoration verification.
+
+
+run-reload-continuity.sh
+Runs the 150-request candidate continuity test.
+
+
+prepare-v3-review.sh
+Creates the pending promotion review record.
+
+
+
+Active-loader commands
+
+
+
+Filename
+One-line purpose
+
+
+
+
+inspect-active-loader-inputs.sh
+Inspects loaders and model-selection integration.
+
+
+run-active-loader-tests.sh
+Runs the initial active-loader tests.
+
+
+run-all-active-loader-tests.sh
+Runs both active-loader test suites.
+
+
+integrate-active-loader.sh
+Adds opt-in active loading and snapshot checksums to the API.
+
+
+check-active-loader-integration.sh
+Reruns loader tests after integration.
+
+
+test-active-image-integration.sh
+Builds/tests application startup and scoring with fake AWS.
+
+
+rerun-active-image-integration.sh
+Rbuilds/reruns that integration test after the missing patch was applied.
+
+
+prepare-active-v1-release.sh
+Packages the exact existing v1 baseline and active manifest locally.
+
+
+inspect-active-manifest.sh
+Checks live-pointer existence and bucket versioning.
+
+
+publish-active-v1.sh
+Conditionally publishes original v1 and its live manifest.
+
+
+run-publish-active-v1.sh
+Runs v1 publication.
+
+
+enable-active-v1-canary.sh
+Deploys active polling with only original v1 authorized.
+
+
+run-active-v1-canary.sh
+Runs that canary deployment.
+
+
+run-active-v1-check.sh
+Verifies exact v1 scoring on both workers.
+
+
+prepare-active-reload-test.sh
+Creates the version-only v1 test artifact locally.
+
+
+prepare-active-test-authorization.sh
+Adds optional second-checksum authorization.
+
+
+build-active-reload-test-image.sh
+Builds the image supporting both verified checksums.
+
+
+test-active-reload-image.sh
+Tests startup, replacement, scoring parity, and rollback offline.
+
+
+run-active-reload-image-test.sh
+Runs that offline image test.
+
+
+diagnose-release-permissions.sh
+Diagnoses host/container UID and private-file permissions.
+
+
+upload-active-reload-test.sh
+Uploads the immutable active test artifact without changing pointers.
+
+
+enable-active-reload-test.sh
+Deploys the canary with both original/test v1 checksums authorized.
+
+
+run-active-reload-test-deployment.sh
+Runs the test-capable canary deployment.
+
+
+verify-active-reload-baseline.sh
+Establishes both current workers on original v1 before switching.
+
+
+
+SageMaker preparation commands
+
+
+
+Filename
+One-line purpose
+
+
+
+
+inspect-sagemaker-integration.sh
+Inventories relevant modules and symbols without AWS access.
+
+
+test-decision-archive.sh
+Runs partitioning tests.
+
+
+integrate-partitioned-decisions.sh
+Patches the label writer to use dual-layout archival.
+
+
+test-partitioned-decision-writes.sh
+Runs archive/writer tests together.
+
+
+test-label-resolution.sh
+Runs feedback-resolution tests.
+
+
+test-sagemaker-dataset-core.sh
+Runs resolver and dataset-builder tests.
+
+
+test-processing-bundle.sh
+Runs processing-bundle tests.
+
+
+test-temporal-dataset.sh
+Runs historical-cutoff split tests.
+
+
+test-sagemaker-training.sh
+Runs trainer tests.
+
+
+test-sagemaker-evaluation.sh
+Runs evaluator tests.
+
+
+inspect-sagemaker-build-environment.sh
+Reports package versions and required-file availability.
+
+
+create-sagemaker-execution-role.sh
+Creates the dedicated sandbox execution role and scoped policy.
+
+
+build-test-sagemaker-image.sh
+Builds the separate batch image and runs its offline tests.
+
+
+
+Existing operational files retained
+aws-all.sh remains the existing synthetic end-to-end test script. Other listed utilities—check.py, diag_features.py, seed.py, smoke.py, stepup_e2e.py, verify_store.py, verify_store_down.py, verify_stream.py, verify_policy.py, verify_fixes.py, block.py, and poison_test.py—were not replaced by the SageMaker work.
+Existing orchestration/documentation files such as all.sh, all-in-one.ps1, and README.md were not migrated to EKS.
+
+7. Important local artifacts and evidence
+All paths below are under ~/fraud-aws-setup/.
+
+
+
+Directory
+Contents / purpose
+
+
+
+
+ml-dataset-ke51yfti
+Original 289-row dataset with insufficient independent fraud groups.
+
+
+ml-collection-c9t9l0qy
+First fresh 300-payment collection evidence and truth.
+
+
+ml-dataset-76hiyh33
+Joined 300-row v2-development dataset.
+
+
+ml-training-c2qoo73y
+V2 model, split assignments, training report, and test gate.
+
+
+ml-challenges-nnitdef2
+Thirty-row challenge dataset and regression evaluation.
+
+
+ml-balanced-9h1euton
+Richer 444-payment collection, subtype coverage, and replay evidence.
+
+
+ml-dataset-w4mtsl4k
+Joined 444-row v3-development dataset.
+
+
+ml-v3-training-74c2ka4f
+V3 model, splits, training metrics, and reserved-test evaluation.
+
+
+shadow-batch-8kzq_4g3
+Twelve-request shadow correctness evidence.
+
+
+shadow-release-nk5mboox
+Original candidate release and proposed manifest.
+
+
+reload-test-gucz9arw
+Identity-only candidate test release and saved original manifest.
+
+
+worker-check-q28iodb_
+First both-worker candidate evidence.
+
+
+worker-reload-1okmx73s
+Both-worker candidate replacement/restoration evidence.
+
+
+reload-continuity-0a33zx27
+Full 150-request continuity evidence.
+
+
+promotion-review-hl1b81hn
+Pending checksum-bound promotion review record.
+
+
+active-v1-release-fo_5e4wv
+Original v1 active artifact and manifest.
+
+
+active-v1-check-7fmjx1t7
+Earlier both-worker active-v1 evidence.
+
+
+active-reload-test-wtmwxkik
+Identity-only v1 active test artifact and manifests.
+
+
+active-v1-check-vmj4s3bm
+Latest worker baseline evidence before active switching.
+
+
+
+Important generated artifact filenames
+
+model_v2.json / model_v3.json / model.json — exported model coefficients and identity.
+evaluation.json — training/validation or processing evaluation metadata, depending on directory.
+splits.json — exact transaction membership for each experiment split.
+test-gate.json — original v2 reserved-test comparison.
+v3-test-evaluation.json — v1/v3 test and known-regression comparison.
+challenge.jsonl / challenge-evaluation.json — challenge inputs and evaluation.
+payments.jsonl, labels.jsonl, coverage.jsonl — requests, synthetic truth, and subtype/device metadata.
+run.json, outcomes.json — collection provenance and request outcomes.
+manifest.json, test-manifest.json, original-manifest.json — release pointers and restoration evidence.
+release-info.json — artifact identity and test-release metadata.
+events.json, stored-events.json, requests.jsonl, planned.json, summary.json — traffic/persistence evidence.
+review.json — pending promotion review inventory.
+training-report.json — SageMaker trainer output lineage and validation metrics.
+decisions-input.jsonl, feedback-input.jsonl, dataset.jsonl, eligibility.json — processing-bundle inputs, rows, and eligibility report.
+
+Source backups created
+
+candidate-backup-lappzgkt
+loader-backup-2_s02n8g
+active-backup-ghi7vye9
+
+Other patch scripts also create uniquely named backup directories; retain them until the changes are committed and reviewed.
+
+8. AWS resources and published objects
+Execution role created
+ARN:
+arn:aws:iam::215409407944:role/fraud-sagemaker-execution-role
+Inline policy: FraudLearningExperimentDataAndLogs
+Its configured access covers:
+
+Experiment objects under sagemaker/fraud-learning/ in the models bucket.
+Scoped SageMaker training/processing log writes.
+SageMaker service trust restricted to the account/region.
+
+It does not yet have selected ECR-image pull permissions or Pipeline orchestration/Registry permissions.
+S3 locations
+
+
+
+Location
+Purpose
+
+
+
+
+fraud-labels-215409407944-us-east-1/decisions/
+Existing archived decision events.
+
+
+decisions/dt=YYYY-MM-DD/
+New partitioned layout implemented in host source; deployment still requires verification.
+
+
+dispositions/
+Existing analyst disposition output.
+
+
+stepup_outcomes/
+Planned durable raw OTP feedback—not completed here.
+
+
+chargebacks/
+Planned raw bank feedback ingestion—not completed here.
+
+
+fraud-models-215409407944-us-east-1/artifacts/
+Checksum-addressed model artifacts.
+
+
+shadow/manifest.json
+Candidate pointer, restored to v3-experimental.
+
+
+live/manifest.json
+Active pointer, currently original v1.
+
+
+sagemaker/fraud-learning/
+Authorized experiment input/output prefix.
+
+
+
+Models-bucket versioning was inspected and was not enabled. We did not enable it.
+Important checksums
+
+
+
+Artifact
+SHA-256
+
+
+
+
+Original v1
+1e773eea7f76c486130c09d7903bd828f9b2cb3afac25831524df2654a920f5d
+
+
+V1 reload test
+c239f3c6f77e617d4220030c8eb5f144060ddbc0b723d4c84959b59403b83378
+
+
+Original v3 candidate
+af5e8e5165445899e565747515e986f6b0867d8cab31222fd5fea5091350962a
+
+
+V3 reload test
+8987293ca949a43f5c3576e8eaf7242790d78a1647c8b347faf1e134e9acbc1a
+
+
+
+
+9. Issues encountered and resolved
+
+Validation contained no fraud — traced to too few independent fraud groups; collected new scenarios.
+V2 learned a device-novelty shortcut — exposed by challenge data; blocked promotion and improved collection.
+Active integration missing from main.py — independent unit tests passed, but image test caught the missing application patch; applied and retested.
+Private release unreadable inside capability-dropped container — diagnosed UID mismatch; ran offline tests as host UID/GID instead of weakening permissions.
+Overly broad shell permissions — identified chmod 777 as unnecessary and supplied owner-only permissions.
+Normal synthetic bursts triggered RULE_CARD_TESTING — recorded as an unresolved rule-level false positive; did not change truth labels to hide it.
