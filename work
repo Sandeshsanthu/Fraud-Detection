@@ -35,12 +35,12 @@ curl -sS -X POST http://localhost:8080/v1/decide \
     \"event_time\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)\",
     \"card_token\": \"tok_9d79b1a37f31801cd11a6706\",
     \"card_bin\": \"999001\",
-    \"amount_minor\": 25000,
+    \"amount_minor\": 250000,
     \"currency\": \"USD\",
     \"channel\": \"ECOM\",
     \"entry_mode\": \"ecom\",
     \"merchant\": {\"id\": \"m_00002\", \"mcc\": \"7995\", \"country\": \"US\"},
-    \"device_id\": \"dev_unknown_new_1\"
+    \"device_id\": \"dev_unknown_new_5\"
   }" | tee /tmp/stepup.json | python3 -m json.tool
 
 
@@ -77,6 +77,9 @@ curl -sS -X POST http://localhost:8080/v1/decide \
     \"merchant\": {\"id\": \"m_00002\", \"mcc\": \"7995\", \"country\": \"NG\"},
     \"device_id\": \"dev_foreign_hacker\"
   }" | python3 -m json.tool
+
+
+  tt
 
 
 
@@ -214,3 +217,23 @@ python3 -m scripts.evaluate_ml_gate \
   --baseline "$HOME/Fraud-Detection/models/model_v1.json" \
   --challenge "$HOME/fraud-aws-setup/ml-challenges-nnitdef2/challenge.jsonl" \
   --config "$HOME/Fraud-Detection/config/config.json"
+
+
+  bash "$HOME/configure-fraud-pipeline.sh" \
+  --apply \
+  --expected-sha256 b5fd404f1e283c7f70d6d4572de1ba6b70e8d4b20d73891a6850a5459c00386f
+
+
+
+  ubuntu@ip-172-31-7-116:~/Fraud-Detection$ export LABEL_BUCKET="fraud-labels-215409407944-us-east-1"
+export AWS_REGION="us-east-1"
+CASE_ID="ml3_ce09481e0ca342998126fc30354ff1b2_0050#1795424288256"
+
+# Idempotent rerun now writes the disposition to the real S3 bucket
+python3 -m scripts.close_case "$CASE_ID" fraud --analyst a.analyst
+
+# Verify the disposition file landed in S3
+aws s3 ls "s3://${LABEL_BUCKET}/dispositions/ml3_ce09481e0ca342998126fc30354ff1b2_0050_1795424288256.json" --region us-east-1
+closed ml3_ce09481e0ca342998126fc30354ff1b2_0050#1795424288256 as fraud (1 payments)
+2026-11-25 11:03:47        280 ml3_ce09481e0ca342998126fc30354ff1b2_0050_1795424288256.json
+ubuntu@ip-172-31-7-116:~/Fraud-Detection$
